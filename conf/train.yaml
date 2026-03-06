@@ -1,0 +1,28 @@
+defaults:
+  - _self_
+
+dataset:
+  root: ./data/IPAD_dataset          # local path OR gs://bucket/path
+  category: "R03"
+  val_split: 0.2
+  test_split: 0.2
+  num_segments: 16       # Lower this down from 32 if VRAM runs out during MIL
+  frames_per_segment: 16
+
+output:
+  dir: ./experiment_outputs
+
+mlflow:
+  tracking_uri: http://localhost:5000
+  experiment_name: industrial-padim-anomaly-detector
+  run_name: hyperparameter-search
+  register_model_name: null
+
+training:
+  max_epochs: 50
+  effective_batch_size: 8
+  batch_size: 8
+  num_gpus: -1
+  num_nodes: 1
+  precision: 16-mixed  # choices: "32", "16-mixed", "bf16-mixed"
+  lr: 1e-4
