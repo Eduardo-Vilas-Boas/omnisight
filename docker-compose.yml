@@ -1,0 +1,91 @@
+services:
+  # --- Always-on infrastructure ---
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mlflow
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: secret
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.10.1
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - /bin/bash
+      - -c
+      - |
+        pip install --no-cache-dir psycopg2-binary -q
+        mlflow server \
+          --backend-store-uri postgresql://mlflow:secret@db/mlflow \
+          --artifacts-destination /mlflow/artifacts \
+          --serve-artifacts \
+          --host 0.0.0.0 \
+          --port 5000 \
+          --allowed-hosts "*" \
+          --cors-allowed-origins "*"
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  serving:
+    build: { context: ., dockerfile: Dockerfile.serving }
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=industrial-padim-anomaly-detector-R03
+      - MODEL_ALIAS=champion
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MLFLOW_ARTIFACT_URI=http://mlflow:5000/artifacts
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      mlflow: { condition: service_healthy }
+
+  # --- Training (on-demand) ---
+  training:
+    build: { context: ., dockerfile: Dockerfile.training }
+    profiles: ["train"]
+    shm_size: '2gb'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./data:/app/data
+      - ./conf:/app/conf
+      - ./src:/app/src
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - CUDA_VISIBLE_DEVICES=0
+    depends_on:
+      mlflow: { condition: service_healthy }
+
+volumes:
+  postgres-data:
+  mlflow-artifacts:

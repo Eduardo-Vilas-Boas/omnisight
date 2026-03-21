@@ -1,0 +1,31 @@
+FROM python:3.12-slim AS serving
+
+WORKDIR /app
+
+# curl is used by the HEALTHCHECK command.
+# No system ffmpeg needed — the `av` Python package bundles its own libav.
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+ENV UV_PYTHON=python3.12 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# ── Python dependencies (change occasionally → good cache layer) ────────────
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --group serving
+
+# Allow `import omnisight.*` without a package install step.
+ENV PYTHONPATH=/app/src
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+EXPOSE 8000
+
+# MODEL_URI and MLFLOW_TRACKING_URI are injected at runtime via --env / Compose.
+CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

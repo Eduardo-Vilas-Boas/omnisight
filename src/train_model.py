@@ -6,9 +6,9 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import hydra
+from hydra.utils import instantiate
 import mlflow
 import mlflow.pytorch
-from matplotlib import category
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -16,8 +16,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from omnisight.ingest.anomaly_detector.dataset import VideoAnomalyDataset
-from omnisight.ingest.anomaly_detector.model import VideoAnomalyDetector
+from .anomaly_detector.dataset import VideoAnomalyDataset
+from .anomaly_detector.model import VideoAnomalyDetector
 
 
 def process_dataset(
@@ -109,6 +109,34 @@ def process_dataset(
                 shutil.copytree(src, dest_base / dest_name)
 
 
+def _resolve_resume_checkpoint(cfg: DictConfig) -> str | None:
+    """Return a local path to the checkpoint to resume from, or None."""
+    run_id = cfg.training.get("resume_from_run_id")
+    if not run_id:
+        return None
+
+    mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
+    client = mlflow.MlflowClient()
+
+    # List artifacts under 'model_checkpoint' — that's where train_model logs it
+    artifacts = client.list_artifacts(run_id, path="model_checkpoint")
+    if not artifacts:
+        raise RuntimeError(
+            f"No artifacts found under 'model_checkpoint' for run {run_id}. "
+            "Make sure the run logged a checkpoint artifact."
+        )
+
+    # Pick the first (and normally only) checkpoint file
+    ckpt_artifact = next(
+        (a for a in artifacts if a.path.endswith(".ckpt")), artifacts[0]
+    )
+    local_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path=ckpt_artifact.path
+    )
+    print(f"Resuming from checkpoint: {local_path} (run {run_id})")
+    return local_path
+
+
 def _run_training(cfg: DictConfig) -> None:
     torch.manual_seed(42)
     np.random.seed(42)
@@ -140,6 +168,8 @@ def _run_training(cfg: DictConfig) -> None:
     print(
         f"Dataset for category '{cfg.dataset.category}' has been processed and is located at: {process_dataset_root / cfg.dataset.category}"
     )
+
+    resume_ckpt = _resolve_resume_checkpoint(cfg)
 
     model = VideoAnomalyDetector(lr=cfg.training.lr)
 
@@ -223,27 +253,34 @@ def _run_training(cfg: DictConfig) -> None:
     with mlflow.start_run(
         run_name=f"{cfg.mlflow.run_name}_{cfg.dataset.category}"
     ) as run:
+        # Capture run_id before MLFlowLogger.finalize() can end the run.
+        run_id = run.info.run_id
 
-        # 5. Trainer — attach to the already-open run via run_id
-        trainer = pl.Trainer(
-            max_epochs=cfg.training.max_epochs,
+        # Log the full Hydra config for reproducibility / deployment
+        mlflow.log_text(OmegaConf.to_yaml(cfg, resolve=True), "config/train.yaml")
+
+        # 5. Trainer — static params come from cfg.trainer (train.yaml), dynamic
+        #    params (accelerator, devices, accumulate_grad_batches) are passed as overrides
+        trainer = instantiate(
+            cfg.trainer,
             accumulate_grad_batches=accumulate_grad_batches,
             accelerator=accelerator,
             devices=devices,
-            precision=cfg.training.precision,
-            sync_batchnorm=True,
             callbacks=[checkpoint_callback],
             logger=pl.loggers.MLFlowLogger(
                 tracking_uri=cfg.mlflow.tracking_uri,
                 experiment_name=cfg.mlflow.experiment_name,
-                run_id=run.info.run_id,
+                run_id=run_id,
             ),
         )
 
-        trainer.fit(model, train_dataloader, val_dataloader)
+        trainer.fit(model, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
         trainer.test(model, test_dataloader)
 
+    # MLFlowLogger.finalize() terminates the active run at the end of fit/test.
+    # Reopen the same run to log the checkpoint and model artifacts.
+    with mlflow.start_run(run_id=run_id):
         # ------------------------------------------------------------------ #
         # Register the best model in the MLflow Model Registry               #
         # ------------------------------------------------------------------ #
@@ -284,7 +321,7 @@ def _run_training(cfg: DictConfig) -> None:
 
             registered_model = mlflow.pytorch.log_model(
                 pytorch_model=best_model,
-                artifact_path=model_name,
+                name=model_name,
                 metadata=model_metadata,
             )
 
@@ -294,6 +331,39 @@ def _run_training(cfg: DictConfig) -> None:
             )
 
             client = mlflow.MlflowClient()
+
+            # Promote to @champion if this version has a higher test_auroc than the
+            # current champion (or if no champion exists yet).
+            is_new_champion = False
+            try:
+                champion_version_info = client.get_model_version_by_alias(
+                    name=model_name, alias="champion"
+                )
+                champion_tags = champion_version_info.tags
+                current_champion_auroc = float(champion_tags.get("test_auroc", 0.0))
+                if test_auroc > current_champion_auroc:
+                    is_new_champion = True
+                    print(
+                        f"New champion: test_auroc {test_auroc:.4f} > "
+                        f"current champion {current_champion_auroc:.4f}"
+                    )
+                else:
+                    print(
+                        f"Keeping existing champion: test_auroc {test_auroc:.4f} <= "
+                        f"current champion {current_champion_auroc:.4f}"
+                    )
+            except mlflow.exceptions.MlflowException:
+                # No champion exists yet — always promote the first model
+                is_new_champion = True
+                print("No existing champion found — promoting this version.")
+
+            if is_new_champion:
+                client.set_registered_model_alias(
+                    name=model_name,
+                    alias="champion",
+                    version=model_version.version,
+                )
+
             created_by = getpass.getuser()
             creation_timestamp = datetime.now().isoformat()
             val_loss_str = f"{float(checkpoint_callback.best_model_score):.4f}"
@@ -349,6 +419,13 @@ def _run_training(cfg: DictConfig) -> None:
                 key="model_type",
                 value="VideoAnomalyDetector",
             )
+            if is_new_champion:
+                client.set_model_version_tag(
+                    name=model_name,
+                    version=model_version.version,
+                    key="deployment_status",
+                    value="champion",
+                )
             client.set_model_version_tag(
                 name=model_name,
                 version=model_version.version,
@@ -370,16 +447,20 @@ def _run_training(cfg: DictConfig) -> None:
             print(f"  - Best Validation Loss: {val_loss_str}")
             print(f"  - Test AUROC:          {test_auroc:.4f}")
             print(f"  - Test Best F1:        {test_best_f1:.4f}")
-            print(f"Model logged with run ID: {run.info.run_id}")
+            print(f"Model logged with run ID: {run_id}")
             print(
-                f"To load registered model: mlflow.pytorch.load_model('models:/{model_name}/{model_version.version}')"
+                f"To load registered model by version:  mlflow.pytorch.load_model('models:/{model_name}/{model_version.version}')"
             )
+            if is_new_champion:
+                print(
+                    f"To load registered model by alias:    mlflow.pytorch.load_model('models:/{model_name}@champion')"
+                )
 
     print(f"Experiment Results for category '{cfg.dataset.category}':")
 
 
 # config_path is relative to this source file; points to <project_root>/conf
-@hydra.main(version_base=None, config_path="../../../../conf", config_name="train")
+@hydra.main(version_base=None, config_path="../conf", config_name="train")
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 

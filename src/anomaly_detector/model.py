@@ -27,7 +27,6 @@ class VideoAnomalyDetector(L.LightningModule):
             nn.ReLU(),
             nn.Dropout(0.6),
             nn.Linear(256, 1),
-            nn.Sigmoid(),
         )
 
     def forward(self, x):
@@ -146,4 +145,12 @@ class VideoAnomalyDetector(L.LightningModule):
         )
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        decay_params = [p for n, p in self.named_parameters() if "bias" not in n]
+        no_decay_params = [p for n, p in self.named_parameters() if "bias" in n]
+        return torch.optim.Adam(
+            [
+                {"params": decay_params, "weight_decay": self.hparams.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=self.hparams.lr,
+        )

@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.4
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04 AS base
+
+# System dependencies (rarely change)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+ENV UV_PYTHON=python3.12 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+WORKDIR /app
+
+# Dependencies (change occasionally) — copy lock files first for layer caching
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --group training
+
+ENTRYPOINT ["uv", "run", "python", "-m", "src.train_model"]
