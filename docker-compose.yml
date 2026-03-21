@@ -59,8 +59,10 @@ services:
       - MODEL_ALIAS=champion
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - MLFLOW_ARTIFACT_URI=http://mlflow:5000/artifacts
+      - SAVE_LOCALLY=true
     volumes:
       - ./src:/app/src
+      - ./outputs:/app/outputs
     depends_on:
       mlflow: { condition: service_healthy }
 

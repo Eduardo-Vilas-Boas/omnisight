@@ -2,18 +2,18 @@ defaults:
   - _self_
 
 dataset:
-  root: ./data/IPAD_dataset          # local path OR gs://bucket/path
+  root: ./data/IPAD_dataset # local path OR gs://bucket/path
   category: "R03"
   val_split: 0.2
   test_split: 0.2
-  num_segments: 16       # Lower this down from 32 if VRAM runs out during MIL
+  num_segments: 16 # Lower this down from 32 if VRAM runs out during MIL
   frames_per_segment: 16
 
 output:
   dir: ./experiment_outputs
 
 mlflow:
-  tracking_uri: http://localhost:5000
+  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://localhost:5000}
   experiment_name: industrial-padim-anomaly-detector
   run_name: hyperparameter-search
   register_model_name: null
@@ -24,5 +24,17 @@ training:
   batch_size: 8
   num_gpus: -1
   num_nodes: 1
-  precision: 16-mixed  # choices: "32", "16-mixed", "bf16-mixed"
+  precision: 16-mixed # choices: "32", "16-mixed", "bf16-mixed"
   lr: 1e-4
+  resume_from_run_id: null
+  check_val_every_n_epoch: 10
+  num_workers: 0  # 0 disables multiprocessing, avoiding Docker /dev/shm limits. I did this because my GPU is not very powerful, but you can set this to a higher value if your GPU can handle it and you have enough shared memory.
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  max_epochs: ${training.max_epochs}
+  precision: ${training.precision}
+  sync_batchnorm: true
+  check_val_every_n_epoch: ${training.check_val_every_n_epoch}
+  num_nodes: ${training.num_nodes}
+  # accelerator, devices, accumulate_grad_batches are resolved at runtime in _run_training

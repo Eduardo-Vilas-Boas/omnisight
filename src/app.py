@@ -10,7 +10,6 @@ MODEL_NAME          Registered MLflow model name
 MODEL_ALIAS         MLflow model alias (default: champion)
 MODEL_TAG           Backward-compatible alias env var name
 MLFLOW_TRACKING_URI MLflow tracking server URL
-NUM_SEGMENTS        Number of temporal segments used during inference
 FRAMES_PER_SEGMENT  Frames sampled per segment
 ANOMALY_THRESHOLD   Score above which a clip is flagged as anomalous
 SAVE_LOCALLY        Set to "true" to write results to the outputs/ directory
@@ -96,18 +95,18 @@ app = FastAPI(
 
 
 def _load_model_hyperparams() -> None:
-    """Populate NUM_SEGMENTS, FRAMES_PER_SEGMENT and ANOMALY_THRESHOLD from the
+    """Populate FRAMES_PER_SEGMENT and ANOMALY_THRESHOLD from the
     MLflow model registry, falling back to environment variables when the
     values are not found.
 
     The training script stores these under two possible locations:
     * ``ModelInfo.metadata``  — when ``mlflow.pytorch.log_model`` is called
-      with ``metadata={"num_segments": …, "frames_per_segment": …,
+      with ``metadata={"frames_per_segment": …,
       "test_best_threshold": …}``
     * Run params / tags      — when ``mlflow.log_params`` / ``mlflow.set_tags``
       are used inside the training run.
     """
-    global NUM_SEGMENTS, FRAMES_PER_SEGMENT, ANOMALY_THRESHOLD
+    global FRAMES_PER_SEGMENT, ANOMALY_THRESHOLD
 
     client = mlflow.MlflowClient()
     model_version = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
@@ -117,8 +116,6 @@ def _load_model_hyperparams() -> None:
     try:
         info = mlflow.models.get_model_info(model_source)
         meta = info.metadata or {}
-        if "num_segments" in meta:
-            NUM_SEGMENTS = int(meta["num_segments"])
         if "frames_per_segment" in meta:
             FRAMES_PER_SEGMENT = int(meta["frames_per_segment"])
         if "test_best_threshold" in meta:
@@ -129,18 +126,12 @@ def _load_model_hyperparams() -> None:
         meta = {}
 
     # ── 2. Fill any still-missing values from the producing run's params ─────
-    missing = (
-        "num_segments" not in meta
-        or "frames_per_segment" not in meta
-        or "test_best_threshold" not in meta
-    )
+    missing = "frames_per_segment" not in meta or "test_best_threshold" not in meta
     if missing:
         try:
             run = client.get_run(model_version.run_id)
             if run:
                 params = run.data.params
-                if "num_segments" not in meta and "num_segments" in params:
-                    NUM_SEGMENTS = int(params["num_segments"])
                 if "frames_per_segment" not in meta and "frames_per_segment" in params:
                     FRAMES_PER_SEGMENT = int(params["frames_per_segment"])
                 if (
@@ -153,8 +144,7 @@ def _load_model_hyperparams() -> None:
             print(f"Could not read run params ({exc}); using env-var defaults.")
 
     print(
-        f"Effective hyperparams — NUM_SEGMENTS={NUM_SEGMENTS}, "
-        f"FRAMES_PER_SEGMENT={FRAMES_PER_SEGMENT}, "
+        f"Effective hyperparams — FRAMES_PER_SEGMENT={FRAMES_PER_SEGMENT}, "
         f"ANOMALY_THRESHOLD={ANOMALY_THRESHOLD}"
     )
 
@@ -201,15 +191,28 @@ def _reload_model_from_registry(model_name: str, model_alias: str) -> None:
     _preproc = preproc
     print(
         f"Model ready on {_device}. resize={h}x{w}, "
-        f"segments={NUM_SEGMENTS}x{FRAMES_PER_SEGMENT} frames, "
+        f"frames_per_segment={FRAMES_PER_SEGMENT}, "
         f"threshold={ANOMALY_THRESHOLD}."
     )
 
 
-def _preprocess_video(path: str) -> torch.Tensor:
-    """Decode an MP4 file and return a model-ready tensor of shape (1, N, T, C, H, W)."""
-    frames, _, _ = torchvision.io.read_video(path, output_format="TCHW", pts_unit="sec")
-    # frames: (T, C, H, W) uint8
+def _preprocess_video(path: str) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Decode an MP4 file once and return both the model input tensor and raw segments.
+
+    Decoding only once guarantees that the raw frames used for visualization
+    are exactly the same frames (same boundaries, same padding) that the model
+    and Grad-CAM operate on.
+
+    Returns
+    -------
+    video_tensor : (1, N, T, C, H, W) float — normalized model input
+    raw_segments : list of N tensors, each (T, C, H, W) uint8 at resize_to
+    """
+    frames, _, info = torchvision.io.read_video(
+        path, output_format="TCHW", pts_unit="sec"
+    )
+    # frames: (total_T, C, H, W) uint8
+    fps: float = float(info.get("video_fps", 30.0))
 
     total_frames = frames.shape[0]
     if total_frames == 0:
@@ -219,12 +222,12 @@ def _preprocess_video(path: str) -> torch.Tensor:
     std = _preproc["std"]
     resize_to = _preproc["resize_to"]
 
-    # Sample NUM_SEGMENTS evenly-spaced start positions across the video.
-    start_indices = torch.linspace(0, max(total_frames - 1, 0), NUM_SEGMENTS).long()
+    # Slide through all frames, FRAMES_PER_SEGMENT at a time — no gaps.
+    start_indices = range(0, total_frames, FRAMES_PER_SEGMENT)
 
-    segments: list[torch.Tensor] = []
-    for idx in start_indices:
-        s = idx.item()
+    normalized_segments: list[torch.Tensor] = []
+    raw_segments: list[torch.Tensor] = []
+    for s in start_indices:
         e = min(s + FRAMES_PER_SEGMENT, total_frames)
         clip = frames[s:e]  # (T', C, H, W) uint8
 
@@ -243,13 +246,17 @@ def _preprocess_video(path: str) -> torch.Tensor:
                     (FRAMES_PER_SEGMENT, 3, *resize_to), dtype=torch.uint8
                 )
 
+        # Keep the resized uint8 clip for visualization before normalizing.
+        raw_segments.append(clip)
+
         # Normalise: [0, 255] → [0, 1] → VideoMAE mean/std
-        clip = clip.float() / 255.0
-        clip = (clip - mean) / std  # (T, C, H, W)
-        segments.append(clip)
+        clip_norm = clip.float() / 255.0
+        clip_norm = (clip_norm - mean) / std  # (T, C, H, W)
+        normalized_segments.append(clip_norm)
 
     # (N, T, C, H, W) → add batch dim → (1, N, T, C, H, W)
-    return torch.stack(segments).unsqueeze(0)
+    video_tensor = torch.stack(normalized_segments).unsqueeze(0)
+    return video_tensor, raw_segments, fps
 
 
 # ---------------------------------------------------------------------------
@@ -343,9 +350,8 @@ def _gradcam_for_segment(clips: torch.Tensor) -> torch.Tensor:
     cam = F.relu((alpha * act).sum(dim=-1))  # (1, num_patches)
     cam = cam.squeeze(0)  # (num_patches,)
 
-    # Normalise to [0, 1]
-    cam = cam - cam.min()
-    cam = cam / (cam.max() + 1e-8)
+    # Raw ReLU values — normalization is deferred to the caller so that
+    # global statistics across all segments can be used.
 
     expected = t_p * h_p * w_p
     if cam.shape[0] != expected:
@@ -368,9 +374,8 @@ def _gradcam_for_segment(clips: torch.Tensor) -> torch.Tensor:
 def _overlay_heatmap(
     raw_frames: torch.Tensor,
     cam: torch.Tensor,
-    alpha: float = 0.45,
 ) -> list[str]:
-    """Blend a Grad-CAM heatmap over raw video frames.
+    """Apply gradient-based opacity to raw video frames.
 
     Parameters
     ----------
@@ -378,26 +383,22 @@ def _overlay_heatmap(
         Uint8 tensor of shape ``(T, C, H, W)`` — original decoded frames.
     cam:
         Float tensor of shape ``(T, H, W)`` — normalised heatmap in ``[0, 1]``.
-    alpha:
-        Blending weight for the colourised heatmap overlay.
 
     Returns
     -------
     list[str]
-        One base64-encoded JPEG string per frame.
+        One base64-encoded JPEG string per frame.  Pixels where cam=0 appear
+        at 50 % brightness; pixels where cam=1 appear at full brightness.
     """
     frames_b64: list[str] = []
     for i in range(raw_frames.shape[0]):
         frame_np = (
             raw_frames[i].permute(1, 2, 0).numpy().astype(np.float32)
         )  # (H, W, 3)
-        heat_np = cam[i].numpy()  # (H, W)
-        heat_rgb = _jet_colormap(heat_np).astype(np.float32)  # (H, W, 3)
-        blended = (
-            ((1.0 - alpha) * frame_np + alpha * heat_rgb).clip(0, 255).astype(np.uint8)
-        )
+        alpha_map = (0.5 + 0.5 * cam[i].numpy())[..., None]  # (H, W, 1)
+        output = (alpha_map * frame_np).clip(0, 255).astype(np.uint8)
         buf = BytesIO()
-        Image.fromarray(blended).save(buf, format="JPEG", quality=85)
+        Image.fromarray(output).save(buf, format="JPEG", quality=85)
         frames_b64.append(base64.b64encode(buf.getvalue()).decode())
     return frames_b64
 
@@ -412,14 +413,13 @@ def _create_result_video(
     result: dict,
     raw_frames_list: list[torch.Tensor],
     cam_list: list[torch.Tensor],
-    fps: int = 8,
+    fps: float = 30.0,
 ) -> None:
-    """Write a side-by-side MP4 to *run_dir/result.mp4*.
+    """Write an opacity-based anomaly highlight MP4 to *run_dir/result.mp4*.
 
-    Each frame is composed of:
-    * **Left half** — original decoded video frame.
-    * **Right half** — jet-coloured Grad-CAM heatmap (black for normal segments).
-    * **Title banner** — shows the segment anomaly score and verdict.
+    Each frame shows the original video with per-pixel brightness derived from
+    the gradient map: cam=0 → 50 % brightness, cam=1 → full brightness.
+    A title banner at the top shows the segment anomaly score and verdict.
     """
     banner_h = 36
     all_frames: list[np.ndarray] = []
@@ -433,13 +433,15 @@ def _create_result_video(
         )
 
         for t in range(seg_raw.shape[0]):
-            left = seg_raw[t].permute(1, 2, 0).numpy()  # (H, W, 3) uint8
-            heat = _jet_colormap(cam[t].numpy())  # (H, W, 3) uint8
-            side_by_side = np.concatenate([left, heat], axis=1)  # (H, 2W, 3)
+            frame_np = (
+                seg_raw[t].permute(1, 2, 0).numpy().astype(np.float32)
+            )  # (H, W, 3)
+            alpha_map = (0.5 + 0.5 * cam[t].numpy())[..., None]  # (H, W, 1)
+            rendered = (alpha_map * frame_np).clip(0, 255).astype(np.uint8)  # (H, W, 3)
 
             # Prepend title banner
-            banner = np.zeros((banner_h, side_by_side.shape[1], 3), dtype=np.uint8)
-            frame = np.concatenate([banner, side_by_side], axis=0)
+            banner = np.zeros((banner_h, rendered.shape[1], 3), dtype=np.uint8)
+            frame = np.concatenate([banner, rendered], axis=0)
 
             img = Image.fromarray(frame)
             ImageDraw.Draw(img).text((8, 8), title, fill=(255, 255, 255))
@@ -527,7 +529,7 @@ async def analyze(file: UploadFile = File(...)):
     segment_scores  list[float]     – per-segment MIL scores
     is_anomalous    bool            – True when anomaly_score > threshold
     threshold       float           – value of ANOMALY_THRESHOLD at serve time
-    num_segments    int             – number of temporal segments evaluated
+    num_segments    int             – number of segments processed (video length / FRAMES_PER_SEGMENT)
     segments        list[dict]      – one entry per segment:
 
         segment_index       int       – position in segment_scores
@@ -549,12 +551,9 @@ async def analyze(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        video_tensor = _preprocess_video(tmp_path)  # (1, N, T, C, H, W)
-
-        # Decode raw uint8 frames for heatmap overlay.
-        raw_all, _, _ = torchvision.io.read_video(
-            tmp_path, output_format="TCHW", pts_unit="sec"
-        )  # (total_T, C, H_orig, W_orig)
+        # Single decode: returns both normalized model input and raw uint8 segments
+        # with identical boundaries and padding — guarantees alignment with Grad-CAM.
+        video_tensor, raw_segments_list, video_fps = _preprocess_video(tmp_path)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     finally:
@@ -569,57 +568,49 @@ async def analyze(file: UploadFile = File(...)):
         segment_scores: list[float] = scores.squeeze(0).tolist()
         anomaly_score = float(max(segment_scores))
 
-        total_frames = raw_all.shape[0]
-        start_indices = torch.linspace(0, max(total_frames - 1, 0), NUM_SEGMENTS).long()
         resize_to = _preproc["resize_to"]
+        raw_cams: list[torch.Tensor] = []
 
-        segments_out: list[dict] = []
-        raw_segments_list: list[torch.Tensor] = []
-        cam_list: list[torch.Tensor] = []
+        # ---- Phase 1: compute raw (unnormalized) Grad-CAM maps ----
         for seg_idx, seg_score in enumerate(segment_scores):
             seg_is_anomalous = seg_score > ANOMALY_THRESHOLD
-
-            # ---- Extract & normalise raw frames for this segment ----
-            s = start_indices[seg_idx].item()
-            e = min(s + FRAMES_PER_SEGMENT, total_frames)
-            seg_raw = raw_all[s:e]  # (T', C, H_orig, W_orig) uint8
-
-            if seg_raw.shape[-2:] != tuple(resize_to):
-                seg_raw = F.interpolate(
-                    seg_raw.float(),
-                    size=resize_to,
-                    mode="bilinear",
-                    align_corners=False,
-                ).byte()
-
-            if seg_raw.shape[0] < FRAMES_PER_SEGMENT:
-                if seg_raw.shape[0] > 0:
-                    pad = seg_raw[-1:].expand(
-                        FRAMES_PER_SEGMENT - seg_raw.shape[0], -1, -1, -1
-                    )
-                    seg_raw = torch.cat([seg_raw, pad], dim=0)
-                else:
-                    seg_raw = torch.zeros(
-                        (FRAMES_PER_SEGMENT, 3, *resize_to), dtype=torch.uint8
-                    )
-
-            # ---- Grad-CAM or black map ----
             if seg_is_anomalous:
                 seg_tensor = video_tensor_device[:, seg_idx, :]  # (1, T, C, H, W)
-                cam = _gradcam_for_segment(seg_tensor)  # (T, H, W) in [0,1]
+                cam = _gradcam_for_segment(seg_tensor)  # (T, H, W) raw ReLU values
             else:
-                cam = torch.zeros(
-                    FRAMES_PER_SEGMENT, *resize_to
-                )  # black — no activation shown
+                cam = torch.zeros(FRAMES_PER_SEGMENT, *resize_to)
+            raw_cams.append(cam)
 
-            raw_segments_list.append(seg_raw)
+        # ---- Phase 2: global normalization using all anomalous segments ----
+        anomalous_cams = [
+            raw_cams[i] for i, s in enumerate(segment_scores) if s > ANOMALY_THRESHOLD
+        ]
+        if anomalous_cams:
+            all_vals = torch.cat([c.flatten() for c in anomalous_cams])
+            g_min = all_vals.min()
+            g_max = all_vals.max()
+        else:
+            g_min, g_max = torch.tensor(0.0), torch.tensor(1.0)
+
+        cam_list: list[torch.Tensor] = []
+        for i, cam in enumerate(raw_cams):
+            if segment_scores[i] > ANOMALY_THRESHOLD:
+                cam = (cam - g_min) / (g_max - g_min + 1e-8)
+                cam = cam.clamp(0.0, 1.0)
             cam_list.append(cam)
+
+        # ---- Phase 3: generate heatmap overlays with globally-normalized cams ----
+        segments_out: list[dict] = []
+        for seg_idx, seg_score in enumerate(segment_scores):
+            seg_is_anomalous = seg_score > ANOMALY_THRESHOLD
             segments_out.append(
                 {
                     "segment_index": seg_idx,
                     "segment_score": seg_score,
                     "is_anomalous": seg_is_anomalous,
-                    "frames_base64_jpeg": _overlay_heatmap(seg_raw, cam),
+                    "frames_base64_jpeg": _overlay_heatmap(
+                        raw_segments_list[seg_idx], cam_list[seg_idx]
+                    ),
                 }
             )
 
@@ -628,13 +619,15 @@ async def analyze(file: UploadFile = File(...)):
         "segment_scores": segment_scores,
         "is_anomalous": anomaly_score > ANOMALY_THRESHOLD,
         "threshold": ANOMALY_THRESHOLD,
-        "num_segments": NUM_SEGMENTS,
+        "num_segments": len(segment_scores),
         "segments": segments_out,
     }
 
     if SAVE_LOCALLY:
         run_dir = _save_results_locally(file.filename or "upload.mp4", result)
-        _create_result_video(run_dir, result, raw_segments_list, cam_list)
+        _create_result_video(
+            run_dir, result, raw_segments_list, cam_list, fps=video_fps
+        )
 
     return result
 
@@ -667,7 +660,6 @@ async def reload_model(
         "model_name": MODEL_NAME,
         "model_alias": MODEL_ALIAS,
         "device": str(_device),
-        "num_segments": NUM_SEGMENTS,
         "frames_per_segment": FRAMES_PER_SEGMENT,
         "threshold": ANOMALY_THRESHOLD,
     }
