@@ -71,13 +71,25 @@ class VideoAnomalyDataset(Dataset):
         )
 
         total_frames = len(image_paths)
-        start_indices = torch.linspace(
-            0, max(total_frames - 1, 0), self.num_segments
-        ).long()
+        # Random temporal segment sampling: divide the video into num_segments
+        # equal bins and pick a random start within each bin.  This ensures
+        # full temporal coverage while exposing different clips every epoch.
+        if total_frames <= self.num_segments:
+            # Fewer frames than segments — fall back to evenly spaced.
+            start_indices = (
+                torch.linspace(0, max(total_frames - 1, 0), self.num_segments)
+                .long()
+                .tolist()
+            )
+        else:
+            bin_size = total_frames // self.num_segments
+            start_indices = [
+                torch.randint(i * bin_size, (i + 1) * bin_size, (1,)).item()
+                for i in range(self.num_segments)
+            ]
 
         video_data = []
         for start in start_indices:
-            start = start.item()
             end = min(start + self.frames_per_segment, total_frames)
 
             clip_frames = []
