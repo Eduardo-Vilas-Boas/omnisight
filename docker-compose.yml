@@ -61,7 +61,6 @@ services:
       - MLFLOW_ARTIFACT_URI=http://mlflow:5000/artifacts
       - SAVE_LOCALLY=true
     volumes:
-      - ./src:/app/src
       - ./outputs:/app/outputs
     depends_on:
       mlflow: { condition: service_healthy }
@@ -80,8 +79,6 @@ services:
               capabilities: [gpu]
     volumes:
       - ./data:/app/data
-      - ./conf:/app/conf
-      - ./src:/app/src
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - CUDA_VISIBLE_DEVICES=0

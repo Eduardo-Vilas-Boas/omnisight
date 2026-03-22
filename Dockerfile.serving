@@ -19,6 +19,8 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --group serving
 
+COPY src/ /app/src/
+
 # Allow `import omnisight.*` without a package install step.
 ENV PYTHONPATH=/app/src
 

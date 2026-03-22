@@ -20,4 +20,8 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --group training
 
+# Training code (changes frequently)
+COPY src/ /app/src/
+COPY conf/ /app/conf/
+
 ENTRYPOINT ["uv", "run", "python", "-m", "src.train_model"]

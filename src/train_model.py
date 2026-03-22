@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import getpass
 import os
 from datetime import datetime
@@ -255,6 +256,15 @@ def _run_training(cfg: DictConfig) -> None:
     ) as run:
         # Capture run_id before MLFlowLogger.finalize() can end the run.
         run_id = run.info.run_id
+
+        _project_root = Path(__file__).parent.parent
+        mlflow.log_artifact(str(_project_root / "pyproject.toml"), "environment")
+        mlflow.log_artifact(str(_project_root / "uv.lock"), "environment")
+
+        git_hash = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+        )
+        mlflow.log_param("git_commit", git_hash)
 
         # Log the full Hydra config for reproducibility / deployment
         mlflow.log_text(OmegaConf.to_yaml(cfg, resolve=True), "config/train.yaml")
