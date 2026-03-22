@@ -169,6 +169,59 @@ omnisight/
 
 ---
 
+## Demo
+
+Two example inferences on the **R03** category (real-world factory footage), using the trained
+`champion` model registered in MLflow. Both videos are 16 frames per segment; anomaly scores are
+produced by the MIL ranking head and compared against the learned threshold (`0.258`).
+
+<table>
+<tr>
+<th>✅ Normal — <code>R03/test/normal/training_02</code></th>
+<th>🚨 Abnormal — <code>R03/test/abnormal/testing_01</code></th>
+</tr>
+<tr>
+<td>
+<video src="docs/normal_result.mp4" controls width="100%" style="height:320px;object-fit:contain;">
+  <a href="docs/normal_result.mp4">Watch normal result video</a>
+</video>
+</td>
+<td>
+<video src="docs/abnormal_result.mp4" controls width="100%" style="height:320px;object-fit:contain;">
+  <a href="docs/abnormal_result.mp4">Watch abnormal result video</a>
+</video>
+</td>
+</tr>
+<tr>
+<td>
+
+All 44 segments score well below the threshold. Original frames are returned unaltered (zero Grad-CAM map).
+
+| Metric | Value |
+|--------|-------|
+| Peak anomaly score | `0.050` |
+| Threshold | `0.258` |
+| Verdict | ✅ **Normal** |
+| Segments flagged | 0 / 44 |
+
+</td>
+<td>
+
+A cluster of 11 segments (31–41) fires above the threshold. Grad-CAM overlays highlight the spatiotemporal regions driving each score.
+
+| Metric | Value |
+|--------|-------|
+| Peak anomaly score | `0.990` |
+| Threshold | `0.258` |
+| Verdict | 🚨 **Anomalous** |
+| Segments flagged | 11 / 45 |
+
+</td>
+</tr>
+</table>
+
+---
+
 ## Quick start
 
 ### Local development
@@ -196,18 +249,66 @@ Experiment metrics, parameters, and the best checkpoint are automatically logged
 ### Docker
 
 The full stack (PostgreSQL, MLflow tracking server, and the serving API) is managed with Docker
-Compose:
+Compose.
+
+#### 1. Start the infrastructure
 
 ```bash
-# Start infrastructure + serving API
+# Start PostgreSQL, MLflow tracking server, and the serving API in the background
 docker compose up -d
-
-# Run training (on-demand, requires NVIDIA Container Toolkit)
-docker compose --profile train up training
 ```
 
-MLflow UI is available at `http://localhost:5000`.
-The inference API is available at `http://localhost:8000`.
+MLflow UI: `http://localhost:5000`  
+Inference API: `http://localhost:8000`
+
+#### 2. Verify the serving API is healthy
+
+```bash
+curl http://localhost:8000/health
+# {"status":"healthy"}
+```
+
+#### 3. Run a training job
+
+Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+The job runs detached (`-d`) and the container is removed automatically on completion (`--rm`).
+Track progress in the MLflow UI at `http://localhost:5000`.
+
+```bash
+GIT_COMMIT=$(git rev-parse HEAD) docker compose --profile train build training
+docker compose --profile train run -d --rm training
+```
+
+#### 4. Promote the trained model
+
+Once training finishes, open the MLflow UI, navigate to the registered model version, and set
+its alias to `champion`. The serving container will use this alias on the next reload.
+
+#### 5. Reload the serving container
+
+```bash
+docker compose restart serving
+```
+
+#### 6. Analyse a video
+
+```bash
+# Returns JSON with per-segment anomaly scores, an overall verdict, and base64 Grad-CAM frames
+curl -X POST http://localhost:8000/analyze \
+  -F "file=@/path/to/video.mp4"
+```
+
+Results are also written to `outputs/` when `SAVE_LOCALLY=true` (the default in
+`docker-compose.yml`):
+
+```
+outputs/
+  {timestamp}_{video_stem}/
+    summary.json          ← scores, per-segment flags, threshold
+    result.mp4            ← annotated video with score banners + Grad-CAM overlays
+    segment_{i:02d}/
+      frame_{j:03d}.jpg   ← per-frame JPEG (Grad-CAM overlay on anomalous segments)
+```
 
 ---
 
@@ -236,6 +337,18 @@ The model is evaluated on a held-out test split after training. Metrics logged t
 
 - **AUROC** — area under the ROC curve for bag-level anomaly scores
 - **Best F1** — F1 score at the threshold that maximises it (swept over 200 candidates)
+
+For the current R03 run, the model reaches:
+
+- `test_auroc = 1.0`
+- `test_best_f1 = 1.0`
+
+These results indicate excellent **detection** performance at the video / segment-score level.
+At the same time, Grad-CAM visualisations can appear less precise than expected. This is
+consistent with the weakly supervised MIL setup: training optimises bag-level ranking (normal vs
+abnormal clips), not pixel-level or frame-level localisation. In other words, the model can be
+very strong at deciding *whether* an anomaly exists while being less consistent at showing
+*exactly where* it is in each frame.
 
 ---
 
