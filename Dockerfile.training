@@ -3,7 +3,7 @@ FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04 AS base
 
 # System dependencies (rarely change)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.12 python3.12-venv curl && \
+    python3.12 python3.12-venv curl git && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
