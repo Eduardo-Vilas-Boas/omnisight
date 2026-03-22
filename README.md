@@ -88,9 +88,13 @@ frame and ignoring the rest.
 
 > Liu, J. et al. (2024). *IPAD: Industrial Process Anomaly Detection Dataset*. Shanghai Jiao Tong University & Lenovo Research.
 
-<video src="https://ljf1113.github.io/IPAD_VAD/static/videos/IPAD_intro.mp4" controls width="100%">
-  <a href="https://ljf1113.github.io/IPAD_VAD/static/videos/IPAD_intro.mp4">Watch the IPAD dataset introduction video</a>
-</video>
+<a href="https://ljf1113.github.io/IPAD_VAD/" title="Open the IPAD project page">
+  <img src="docs/ipad_dataset.png" alt="IPAD dataset preview" width="100%" />
+</a>
+
+GitHub does not reliably render embedded video players in README files, so the screenshot above
+links to the full [IPAD project page](https://ljf1113.github.io/IPAD_VAD/) and the
+[dataset introduction video](https://ljf1113.github.io/IPAD_VAD/static/videos/IPAD_intro.mp4).
 
 ### Overview
 
@@ -174,6 +178,7 @@ omnisight/
 Two example inferences on the **R03** category (real-world factory footage), using the trained
 `champion` model registered in MLflow. Both videos are 16 frames per segment; anomaly scores are
 produced by the MIL ranking head and compared against the learned threshold (`0.258`).
+Previews below are GIFs for GitHub compatibility; click either preview to open the full MP4.
 
 <table>
 <tr>
@@ -182,14 +187,14 @@ produced by the MIL ranking head and compared against the learned threshold (`0.
 </tr>
 <tr>
 <td>
-<video src="docs/normal_result.mp4" controls width="100%" style="height:320px;object-fit:contain;">
-  <a href="docs/normal_result.mp4">Watch normal result video</a>
-</video>
+<a href="docs/normal_result.mp4" title="Open full MP4">
+  <img src="docs/normal_result.gif" alt="Normal inference preview" style="height:320px;max-width:100%;object-fit:contain;" />
+</a>
 </td>
 <td>
-<video src="docs/abnormal_result.mp4" controls width="100%" style="height:320px;object-fit:contain;">
-  <a href="docs/abnormal_result.mp4">Watch abnormal result video</a>
-</video>
+<a href="docs/abnormal_result.mp4" title="Open full MP4">
+  <img src="docs/abnormal_result.gif" alt="Abnormal inference preview" style="height:320px;max-width:100%;object-fit:contain;" />
+</a>
 </td>
 </tr>
 <tr>
@@ -207,7 +212,7 @@ All 44 segments score well below the threshold. Original frames are returned una
 </td>
 <td>
 
-A cluster of 11 segments (31–41) fires above the threshold. Grad-CAM overlays highlight the spatiotemporal regions driving each score.
+A cluster of 11 segments (31–41) fires above the threshold. The current Grad-CAM overlays provide a rough indication of what drives each score, but they do not yet reliably isolate the exact anomalous area.
 
 | Metric | Value |
 |--------|-------|
@@ -348,7 +353,8 @@ At the same time, Grad-CAM visualisations can appear less precise than expected.
 consistent with the weakly supervised MIL setup: training optimises bag-level ranking (normal vs
 abnormal clips), not pixel-level or frame-level localisation. In other words, the model can be
 very strong at deciding *whether* an anomaly exists while being less consistent at showing
-*exactly where* it is in each frame.
+*exactly where* it is in each frame. For background on the visualisation method itself, see
+[Selvaraju et al. (2017), Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization](https://arxiv.org/pdf/1611.07450).
 
 ---
 
