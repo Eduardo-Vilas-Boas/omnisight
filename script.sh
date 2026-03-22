@@ -13,6 +13,7 @@ curl http://localhost:8000/health
 # -d runs the container in detached mode so it doesn't block your terminal
 # --rm cleans up the container automatically when the job finishes
 # Check the MLflow UI to see the new run appear and track its progress
+GIT_COMMIT=$(git rev-parse HEAD) docker compose --profile train build training
 docker compose --profile train run -d --rm training
 
 # Step 5: Watch training progress in the MLflow UI at localhost:5000

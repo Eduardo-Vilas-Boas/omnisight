@@ -67,7 +67,11 @@ services:
 
   # --- Training (on-demand) ---
   training:
-    build: { context: ., dockerfile: Dockerfile.training }
+    build:
+      context: .
+      dockerfile: Dockerfile.training
+      args:
+        GIT_COMMIT: "${GIT_COMMIT:-}"
     profiles: ["train"]
     shm_size: '2gb'
     deploy:

@@ -261,9 +261,12 @@ def _run_training(cfg: DictConfig) -> None:
         mlflow.log_artifact(str(_project_root / "pyproject.toml"), "environment")
         mlflow.log_artifact(str(_project_root / "uv.lock"), "environment")
 
-        git_hash = (
-            subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-        )
+        git_hash = os.environ.get("GIT_COMMIT")
+        if not git_hash:
+            raise RuntimeError(
+                "GIT_COMMIT env var is not set. Build the image with: "
+                "GIT_COMMIT=$(git rev-parse HEAD) docker compose --profile train build training"
+            )
         mlflow.log_param("git_commit", git_hash)
 
         # Log the full Hydra config for reproducibility / deployment

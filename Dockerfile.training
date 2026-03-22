@@ -13,6 +13,10 @@ ENV UV_PYTHON=python3.12 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
+ARG GIT_COMMIT
+RUN test -n "${GIT_COMMIT}" || { echo 'ERROR: GIT_COMMIT build arg is required. Build with: GIT_COMMIT=$(git rev-parse HEAD) docker compose --profile train build training'; exit 1; }
+ENV GIT_COMMIT=${GIT_COMMIT}
+
 WORKDIR /app
 
 # Dependencies (change occasionally) — copy lock files first for layer caching
