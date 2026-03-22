@@ -374,8 +374,12 @@ def _gradcam_for_segment(clips: torch.Tensor) -> torch.Tensor:
 def _overlay_heatmap(
     raw_frames: torch.Tensor,
     cam: torch.Tensor,
+    alpha: float = 0.4,
 ) -> list[str]:
-    """Apply gradient-based opacity to raw video frames.
+    """Alpha-blend a jet-coloured Grad-CAM heatmap over raw video frames.
+
+    .. math::
+        F_{final} = (1 - \\alpha) \\cdot F_{original} + \\alpha \\cdot F_{gradient}
 
     Parameters
     ----------
@@ -383,20 +387,30 @@ def _overlay_heatmap(
         Uint8 tensor of shape ``(T, C, H, W)`` — original decoded frames.
     cam:
         Float tensor of shape ``(T, H, W)`` — normalised heatmap in ``[0, 1]``.
+    alpha:
+        Blend strength in ``[0, 1]``.  When *cam* is all zeros (normal segment)
+        the original frame is returned unaltered regardless of *alpha*.
 
     Returns
     -------
     list[str]
-        One base64-encoded JPEG string per frame.  Pixels where cam=0 appear
-        at 50 % brightness; pixels where cam=1 appear at full brightness.
+        One base64-encoded JPEG string per frame.
     """
     frames_b64: list[str] = []
+    is_normal = cam.max().item() == 0.0
     for i in range(raw_frames.shape[0]):
         frame_np = (
             raw_frames[i].permute(1, 2, 0).numpy().astype(np.float32)
         )  # (H, W, 3)
-        alpha_map = (0.5 + 0.5 * cam[i].numpy())[..., None]  # (H, W, 1)
-        output = (alpha_map * frame_np).clip(0, 255).astype(np.uint8)
+        if is_normal:
+            output = frame_np.clip(0, 255).astype(np.uint8)
+        else:
+            gradient_np = _jet_colormap(cam[i].numpy()).astype(np.float32)  # (H, W, 3)
+            output = (
+                ((1.0 - alpha) * frame_np + alpha * gradient_np)
+                .clip(0, 255)
+                .astype(np.uint8)
+            )
         buf = BytesIO()
         Image.fromarray(output).save(buf, format="JPEG", quality=85)
         frames_b64.append(base64.b64encode(buf.getvalue()).decode())
@@ -414,11 +428,12 @@ def _create_result_video(
     raw_frames_list: list[torch.Tensor],
     cam_list: list[torch.Tensor],
     fps: float = 30.0,
+    alpha: float = 0.4,
 ) -> None:
-    """Write an opacity-based anomaly highlight MP4 to *run_dir/result.mp4*.
+    """Write an alpha-blended anomaly highlight MP4 to *run_dir/result.mp4*.
 
-    Each frame shows the original video with per-pixel brightness derived from
-    the gradient map: cam=0 → 50 % brightness, cam=1 → full brightness.
+    Each frame is blended as ``(1-alpha)*original + alpha*jet(cam)``.
+    Normal segments (cam=0) are written as-is.
     A title banner at the top shows the segment anomaly score and verdict.
     """
     banner_h = 36
@@ -432,12 +447,22 @@ def _create_result_video(
             f"{'Anomalous' if is_anom else 'Normal'}"
         )
 
+        is_normal = cam.max().item() == 0.0
         for t in range(seg_raw.shape[0]):
             frame_np = (
                 seg_raw[t].permute(1, 2, 0).numpy().astype(np.float32)
             )  # (H, W, 3)
-            alpha_map = (0.5 + 0.5 * cam[t].numpy())[..., None]  # (H, W, 1)
-            rendered = (alpha_map * frame_np).clip(0, 255).astype(np.uint8)  # (H, W, 3)
+            if is_normal:
+                rendered = frame_np.clip(0, 255).astype(np.uint8)
+            else:
+                gradient_np = _jet_colormap(cam[t].numpy()).astype(
+                    np.float32
+                )  # (H, W, 3)
+                rendered = (
+                    ((1.0 - alpha) * frame_np + alpha * gradient_np)
+                    .clip(0, 255)
+                    .astype(np.uint8)
+                )
 
             # Prepend title banner
             banner = np.zeros((banner_h, rendered.shape[1], 3), dtype=np.uint8)
@@ -514,7 +539,7 @@ async def health():
 
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
+async def analyze(file: UploadFile = File(...), alpha: float = 0.4):
     """Receive an MP4 video clip and return anomaly scores and Grad-CAM maps.
 
     For each segment the response includes base64-encoded JPEG frames with a
@@ -609,7 +634,7 @@ async def analyze(file: UploadFile = File(...)):
                     "segment_score": seg_score,
                     "is_anomalous": seg_is_anomalous,
                     "frames_base64_jpeg": _overlay_heatmap(
-                        raw_segments_list[seg_idx], cam_list[seg_idx]
+                        raw_segments_list[seg_idx], cam_list[seg_idx], alpha
                     ),
                 }
             )
@@ -626,7 +651,7 @@ async def analyze(file: UploadFile = File(...)):
     if SAVE_LOCALLY:
         run_dir = _save_results_locally(file.filename or "upload.mp4", result)
         _create_result_video(
-            run_dir, result, raw_segments_list, cam_list, fps=video_fps
+            run_dir, result, raw_segments_list, cam_list, fps=video_fps, alpha=alpha
         )
 
     return result
